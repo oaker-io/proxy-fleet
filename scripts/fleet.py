@@ -155,22 +155,64 @@ def install_3xui(host, creds):
 # ── VLESS+Reality Inbound ────────────────────────────────────
 
 REMOTE_INBOUND_SCRIPT = textwrap.dedent(r'''
-import json, subprocess, sys, urllib.request, urllib.parse, http.cookiejar, secrets, glob
+import json, subprocess, sys, urllib.request, ssl, secrets, glob
 
 port = int(sys.argv[1])
 remark = sys.argv[2]
 panel_port = int(sys.argv[3])
-username = sys.argv[4]
-password = sys.argv[5]
-sni = sys.argv[6]
+sni = sys.argv[4]
 
 # Auto-detect xray binary (amd64 or arm64)
 candidates = glob.glob("/usr/local/x-ui/bin/xray-linux-*")
 XRAY = candidates[0] if candidates else "/usr/local/x-ui/bin/xray-linux-amd64"
 
-# Generate x25519 keys
-# Xray v26+: "PrivateKey: ... / Password: ... / Hash32: ..."
-# Xray older: "Private key: ... / Public key: ..."
+# Get API token from local x-ui
+panel = f"https://localhost:{panel_port}"
+tok_out = subprocess.check_output(["/usr/local/x-ui/x-ui", "setting", "-getApiToken"]).decode().strip()
+api_token = tok_out.replace("apiToken: ", "").strip()
+
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+
+def api_req(path, data=None, headers=None):
+    h = {"Authorization": f"Bearer {api_token}"}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(f"{panel}{path}", data=data, headers=h)
+    return urllib.request.urlopen(req, context=ctx)
+
+# Check for existing VLESS inbound to reuse keys
+resp = api_req("/panel/api/inbounds/list")
+existing = json.loads(resp.read())
+existing_vless = [ib for ib in existing.get("obj", []) if ib.get("protocol") == "vless"]
+
+if existing_vless:
+    # Reuse existing inbound: update port only, preserve keys/UUID
+    ib = existing_vless[0]
+    stream = json.loads(ib.get("streamSettings", "{}"))
+    settings = json.loads(ib.get("settings", "{}"))
+    reality = stream.get("realitySettings", {})
+    clients = settings.get("clients", [])
+    
+    uuid = clients[0]["id"] if clients else subprocess.check_output([XRAY, "uuid"]).decode().strip()
+    pub = reality.get("settings", {}).get("publicKey", "")
+    sid = (reality.get("shortIds", [""]))[0] if reality.get("shortIds") else secrets.token_hex(4)
+    
+    # Update port only
+    ib["port"] = port
+    body = json.dumps(ib).encode()
+    resp = api_req(f"/panel/api/inbounds/update/{ib['id']}", data=body, headers={"Content-Type": "application/json"})
+    result = json.loads(resp.read())
+    
+    print(json.dumps({
+        "success": result.get("success", False),
+        "uuid": uuid, "public_key": pub, "short_id": sid, "port": port,
+        "reused": True
+    }))
+    sys.exit(0)
+
+# No existing VLESS: generate new keys
 keys_out = subprocess.check_output([XRAY, "x25519"]).decode()
 kv = {}
 for l in keys_out.strip().splitlines():
@@ -179,7 +221,7 @@ for l in keys_out.strip().splitlines():
         kv[k.strip()] = v.strip()
 
 priv = kv.get("PrivateKey") or kv.get("Private key", "")
-pub = kv.get("Password") or kv.get("Public key", "")
+pub = kv.get("Password (PublicKey)") or kv.get("Password") or kv.get("Public key", "")
 
 if not priv or not pub:
     print(json.dumps({"success": False, "error": f"Failed to parse x25519 output: {kv}"}))
@@ -187,22 +229,6 @@ if not priv or not pub:
 
 uuid = subprocess.check_output([XRAY, "uuid"]).decode().strip()
 sid = secrets.token_hex(4)
-
-# Login
-panel = f"http://localhost:{panel_port}"
-cj = http.cookiejar.CookieJar()
-opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
-opener.open(f"{panel}/login",
-    urllib.parse.urlencode({"username": username, "password": password}).encode())
-
-# Delete existing VLESS inbounds to avoid duplicates
-req = urllib.request.Request(f"{panel}/panel/api/inbounds/list")
-resp = opener.open(req)
-existing = json.loads(resp.read())
-for ib in existing.get("obj", []):
-    if ib.get("protocol") == "vless":
-        dreq = urllib.request.Request(f"{panel}/panel/api/inbounds/del/{ib['id']}")
-        opener.open(dreq)
 
 settings = json.dumps({
     "clients": [{"id": uuid, "flow": "xtls-rprx-vision", "email": "",
@@ -229,14 +255,13 @@ body = json.dumps({
     "settings": settings, "streamSettings": stream, "sniffing": sniffing
 }).encode()
 
-req = urllib.request.Request(f"{panel}/panel/api/inbounds/add", body,
-    {"Content-Type": "application/json"})
-resp = opener.open(req)
+resp = api_req("/panel/api/inbounds/add", data=body, headers={"Content-Type": "application/json"})
 result = json.loads(resp.read())
 
 print(json.dumps({
     "success": result.get("success", False),
-    "uuid": uuid, "public_key": pub, "short_id": sid, "port": port
+    "uuid": uuid, "public_key": pub, "short_id": sid, "port": port,
+    "reused": False
 }))
 ''')
 
@@ -244,7 +269,7 @@ def create_inbound(host, port, remark, cfg):
     """Create VLESS+Reality inbound on remote host. Returns node info dict."""
     creds = cfg["credentials"]
     defaults = cfg["defaults"]
-    args = f"{port} {remark} {creds['panel_port']} {creds['username']} {creds['password']} {defaults['sni']}"
+    args = f"{port} {remark} {creds['panel_port']} {defaults['sni']}"
     out = ssh_script(host, REMOTE_INBOUND_SCRIPT, args, timeout=30)
     result = json.loads(out)
     if not result.get("success"):
@@ -255,28 +280,33 @@ def create_inbound(host, port, remark, cfg):
 # ── Remote Query ─────────────────────────────────────────────
 
 REMOTE_QUERY_SCRIPT = textwrap.dedent(r'''
-import json, urllib.request, urllib.parse, http.cookiejar, subprocess, sys, glob
+import json, urllib.request, ssl, subprocess, sys, glob
 
 panel_port = int(sys.argv[1])
-username = sys.argv[2]
-password = sys.argv[3]
 
-panel = f"http://localhost:{panel_port}"
-cj = http.cookiejar.CookieJar()
-opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+panel = f"https://localhost:{panel_port}"
+tok_out = subprocess.check_output(["/usr/local/x-ui/x-ui", "setting", "-getApiToken"]).decode().strip()
+api_token = tok_out.replace("apiToken: ", "").strip()
+
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
 
 inbounds = []
 xver = "?"
 
 try:
-    opener.open(f"{panel}/login",
-        urllib.parse.urlencode({"username": username, "password": password}).encode())
-    resp = opener.open(f"{panel}/panel/api/inbounds/list")
+    req = urllib.request.Request(f"{panel}/panel/api/inbounds/list",
+        headers={"Authorization": f"Bearer {api_token}"})
+    resp = urllib.request.urlopen(req, context=ctx)
     data = json.loads(resp.read())
 
+    def _parse(v):
+        return json.loads(v) if isinstance(v, str) else (v or {})
+
     for ib in data.get("obj", []):
-        stream = json.loads(ib.get("streamSettings", "{}"))
-        settings = json.loads(ib.get("settings", "{}"))
+        stream = _parse(ib.get("streamSettings", "{}"))
+        settings = _parse(ib.get("settings", "{}"))
         reality = stream.get("realitySettings", {})
         clients = settings.get("clients", [])
         inbounds.append({
@@ -289,7 +319,6 @@ try:
             "sni": (reality.get("serverNames", [""]))[0] if reality.get("serverNames") else "",
         })
 
-    # Detect xray binary and version
     candidates = glob.glob("/usr/local/x-ui/bin/xray-linux-*")
     if candidates:
         xver = subprocess.check_output(
@@ -304,7 +333,7 @@ print(json.dumps({"inbounds": inbounds, "xray_version": xver}))
 def query_node(host, cfg):
     """Query a node's 3x-ui API for inbound details."""
     creds = cfg["credentials"]
-    args = f"{creds['panel_port']} {creds['username']} {creds['password']}"
+    args = f"{creds['panel_port']}"
     try:
         out = ssh_script(host, REMOTE_QUERY_SCRIPT, args, timeout=15)
         return json.loads(out)
